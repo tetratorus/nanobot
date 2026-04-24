@@ -33,13 +33,23 @@ class MessageTool(Tool):
         self._default_channel = default_channel
         self._default_chat_id = default_chat_id
         self._default_message_id = default_message_id
+        # Matron patch: propagate inbound thread_id through so same-chat replies
+        # (esp. Telegram forum topics) route to the right thread.
+        self._default_thread_id: int | None = None
         self._sent_in_turn: bool = False
 
-    def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    def set_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        thread_id: int | None = None,
+    ) -> None:
         """Set the current message context."""
         self._default_channel = channel
         self._default_chat_id = chat_id
         self._default_message_id = message_id
+        self._default_thread_id = thread_id
 
     def set_send_callback(self, callback: Callable[[OutboundMessage], Awaitable[None]]) -> None:
         """Set the callback for sending messages."""
@@ -92,14 +102,24 @@ class MessageTool(Tool):
         if not self._send_callback:
             return "Error: Message sending not configured"
 
+        metadata: dict = {}
+        if message_id:
+            metadata["message_id"] = message_id
+        # Matron patch: carry the inbound thread_id on same-chat replies so
+        # forum-topic channels (Telegram) route to the correct topic.
+        if (
+            channel == self._default_channel
+            and chat_id == self._default_chat_id
+            and self._default_thread_id is not None
+        ):
+            metadata["message_thread_id"] = self._default_thread_id
+
         msg = OutboundMessage(
             channel=channel,
             chat_id=chat_id,
             content=content,
             media=media or [],
-            metadata={
-                "message_id": message_id,
-            } if message_id else {},
+            metadata=metadata,
         )
 
         try:
