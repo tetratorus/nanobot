@@ -112,9 +112,32 @@ class ChannelManager:
             tasks.append(asyncio.create_task(self._start_channel(name, channel)))
 
         self._notify_restart_done_if_needed()
+        await self._publish_startup_triggers()
 
         # Wait for all to complete (they should run forever)
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _publish_startup_triggers(self) -> None:
+        """Publish a synthetic inbound message per channel on service start.
+
+        Channels that want the agent to react when the service starts should
+        override BaseChannel.build_startup_trigger() to return an InboundMessage.
+        Default is None (no trigger). Failures are swallowed so a bad trigger
+        can never take down service startup.
+        """
+        for name, channel in self.channels.items():
+            try:
+                trigger = channel.build_startup_trigger()
+            except Exception as e:
+                logger.warning("startup trigger build failed for {}: {}", name, e)
+                continue
+            if trigger is None:
+                continue
+            try:
+                await self.bus.publish_inbound(trigger)
+                logger.info("Published startup trigger for {} channel", name)
+            except Exception as e:
+                logger.warning("startup trigger publish failed for {}: {}", name, e)
 
     def _notify_restart_done_if_needed(self) -> None:
         """Send restart completion message when runtime env markers are present."""

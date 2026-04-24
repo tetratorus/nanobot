@@ -95,6 +95,17 @@ class BaseChannel(ABC):
         """
         pass
 
+    def build_startup_trigger(self) -> "InboundMessage | None":
+        """Return a synthetic InboundMessage to publish when the service starts.
+
+        Channels that want the agent to react on service start should override
+        this. Return None (default) to skip — no agent turn is triggered.
+
+        Used by Matron to have agents read the handbook and post a readiness
+        check-in when their service (re)starts.
+        """
+        return None
+
     async def send_delta(self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
         """Deliver a streaming text chunk.
 

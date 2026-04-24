@@ -16,7 +16,7 @@ from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.command.builtin import build_help_text
@@ -190,6 +190,10 @@ class TelegramConfig(Base):
     group_policy: Literal["open", "mention"] = "mention"
     # Matron patch: when non-empty, only respond to messages in these forum topics.
     allowed_thread_ids: list[int] = Field(default_factory=list)
+    # Matron patch: where to publish the synthetic "[system] You just started."
+    # message on service start. If startup_chat_id is empty, no trigger fires.
+    startup_chat_id: str = ""
+    startup_thread_id: int | None = None
     connection_pool_size: int = 32
     pool_timeout: float = 5.0
     streaming: bool = True
@@ -267,6 +271,32 @@ class TelegramChannel(BaseChannel):
         if content == "/dream_restore" or content.startswith("/dream_restore "):
             return content.replace("/dream_restore", "/dream-restore", 1)
         return content
+
+    def build_startup_trigger(self) -> InboundMessage | None:
+        """Matron patch: synthesize a service-start event so the agent runs a turn on boot.
+
+        Fires only when startup_chat_id is set. The agent receives a minimal
+        '[system] You just started.' message and decides what to do based on its
+        own SOUL/handbook (e.g. re-read the handbook, post a readiness check-in).
+        """
+        chat_id = self.config.startup_chat_id
+        if not chat_id:
+            return None
+        metadata: dict = {}
+        session_key: str | None = None
+        if self.config.startup_thread_id is not None:
+            metadata["message_thread_id"] = self.config.startup_thread_id
+            session_key = f"telegram_{chat_id}_topic_{self.config.startup_thread_id}"
+        else:
+            session_key = f"telegram_{chat_id}"
+        return InboundMessage(
+            channel="telegram",
+            sender_id="system",
+            chat_id=str(chat_id),
+            content="[system] You just started.",
+            metadata=metadata,
+            session_key_override=session_key,
+        )
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
