@@ -188,6 +188,8 @@ class TelegramConfig(Base):
     reply_to_message: bool = False
     react_emoji: str = "👀"
     group_policy: Literal["open", "mention"] = "mention"
+    # Matron patch: when non-empty, only respond to messages in these forum topics.
+    allowed_thread_ids: list[int] = Field(default_factory=list)
     connection_pool_size: int = 32
     pool_timeout: float = 5.0
     streaming: bool = True
@@ -804,6 +806,11 @@ class TelegramChannel(BaseChannel):
 
     async def _is_group_message_for_bot(self, message) -> bool:
         """Allow group messages when policy is open, @mentioned, or replying to the bot."""
+        allowed = self.config.allowed_thread_ids
+        if allowed:
+            thread_id = getattr(message, "message_thread_id", None)
+            if thread_id is None or thread_id not in allowed:
+                return False
         if message.chat.type == "private" or self.config.group_policy == "open":
             return True
 
