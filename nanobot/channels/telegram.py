@@ -176,14 +176,19 @@ _STREAM_EDIT_INTERVAL_DEFAULT = 0.6  # min seconds between edit_message_text cal
 # can triage without reading every agent's chat history. Keep this best-effort:
 # it must never break a normal send.
 _HR_INBOX = Path("/matron/workspaces/matron-hr/inbox")
-# Narrow set of patterns deliberately matching only nanobot's actual error
-# emission paths (e.g. _DEFAULT_ERROR_MESSAGE starts with "Sorry, I encountered",
-# provider-retry-exhaustion logs contain "Model request failed", and tool/agent
-# soft-errors are conventionally prefixed with ❌ or ⚠️). High-signal by design;
-# do not widen without re-reviewing the false-positive cost.
+# Narrow set of patterns matching nanobot's actual error emission paths,
+# verified against source:
+#   "Error:"         — runner.py 326/693/694, loop.py 932/965, subagent.py
+#                      168/179/233, providers/* fallback `f"Error: {body_text}"`
+#   "Error calling"  — providers/* outer-exception branch (anthropic 72/529,
+#                      openai_compat 876/1005, azure_openai 120, openai_codex 82,
+#                      base.py 463/499). Trims trailing provider name so Codex
+#                      and Azure variants are caught alongside "Error calling LLM".
+#   "❌" / "⚠️"      — emoji-prefixed soft errors from tools/subagents.
+# High-signal by design; do not widen without re-reviewing false-positive cost.
 _ERROR_TRIGGERS: tuple[tuple[str, str], ...] = (
-    ("startswith", "Sorry, I encountered"),
-    ("contains",   "Model request failed"),
+    ("startswith", "Error:"),
+    ("startswith", "Error calling"),
     ("startswith", "❌"),
     ("startswith", "⚠️"),
 )
