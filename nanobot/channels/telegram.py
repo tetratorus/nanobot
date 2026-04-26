@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import getpass
 import re
 import time
 import unicodedata
+from datetime import datetime, timezone
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from loguru import logger
@@ -167,6 +170,53 @@ def _markdown_to_telegram_html(text: str) -> str:
 _SEND_MAX_RETRIES = 3
 _SEND_RETRY_BASE_DELAY = 0.5  # seconds, doubled each retry
 _STREAM_EDIT_INTERVAL_DEFAULT = 0.6  # min seconds between edit_message_text calls
+
+# --- Error-routing to HR inbox -----------------------------------------------
+# When the model surfaces error-shaped output, drop a copy in HR's inbox so HR
+# can triage without reading every agent's chat history. Keep this best-effort:
+# it must never break a normal send.
+_HR_INBOX = Path("/matron/workspaces/matron-hr/inbox")
+_ERROR_PATTERN = re.compile(
+    r"\b(?:traceback|exception(?:s)?|error(?:s|ed)?|"
+    r"fail(?:s|ed|ing|ure(?:s)?)?)\b",
+    re.IGNORECASE,
+)
+
+
+def _route_error_to_hr_inbox(content: str) -> None:
+    """If outbound model content is error-shaped, drop a copy in HR's inbox.
+
+    Best-effort. Never raises. Called from TelegramChannel.send for final
+    (non-progress) text replies.
+    """
+    if not content or not _ERROR_PATTERN.search(content):
+        return
+    try:
+        if not _HR_INBOX.is_dir():
+            return
+        try:
+            agent = getpass.getuser()
+        except Exception:
+            agent = "unknown-agent"
+        now = datetime.now(timezone.utc)
+        # Microsecond precision in the filename to avoid collisions on bursts.
+        ts_file = now.strftime("%Y%m%dT%H%M%S.%fZ")
+        ts_iso = now.isoformat(timespec="microseconds").replace("+00:00", "Z")
+        path = _HR_INBOX / f"{agent}-{ts_file}-error.md"
+        body = (
+            f"# Error-shaped output from {agent}\n\n"
+            f"- agent: {agent}\n"
+            f"- channel: telegram\n"
+            f"- timestamp: {ts_iso}\n\n"
+            f"## Message content\n\n"
+            f"{content}\n"
+        )
+        path.write_text(body, encoding="utf-8")
+    except Exception as e:
+        # Routing must never break the send. Log at debug; HR can still see
+        # the message in chat.
+        logger.debug("error-routing to HR inbox failed: {}", e)
+# -----------------------------------------------------------------------------
 
 
 @dataclass
@@ -508,6 +558,9 @@ class TelegramChannel(BaseChannel):
 
         # Send text content
         if msg.content and msg.content != "[empty message]":
+            # Mirror error-shaped final replies to HR inbox (skip progress updates).
+            if not msg.metadata.get("_progress", False):
+                _route_error_to_hr_inbox(msg.content)
             render_as_blockquote = bool(msg.metadata.get("_tool_hint"))
             for chunk in split_message(msg.content, TELEGRAM_MAX_MESSAGE_LEN):
                 await self._send_text(
