@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Collection
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
@@ -11,6 +12,12 @@ from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
     from nanobot.agent.memory import Consolidator
+
+# How often (seconds) to actually scan sessions for expiry.
+# The agent loop calls check_expired() every ~1 s of idle time; without
+# throttling this causes ~5 FS ops/sec/agent (glob + stat per session file).
+# 3600 s → at most one scan per hour per agent.
+_COMPACT_POLL_INTERVAL_S = 3600
 
 
 class AutoCompact:
@@ -23,6 +30,7 @@ class AutoCompact:
         self._ttl = session_ttl_minutes
         self._archiving: set[str] = set()
         self._summaries: dict[str, tuple[str, datetime]] = {}
+        self._last_check: float = 0.0  # monotonic timestamp of last real scan
 
     def _is_expired(self, ts: datetime | str | None,
                     now: datetime | None = None) -> bool:
@@ -60,7 +68,16 @@ class AutoCompact:
 
     def check_expired(self, schedule_background: Callable[[Coroutine], None],
                       active_session_keys: Collection[str] = ()) -> None:
-        """Schedule archival for idle sessions, skipping those with in-flight agent tasks."""
+        """Schedule archival for idle sessions, skipping those with in-flight agent tasks.
+
+        Throttled to at most once per _COMPACT_POLL_INTERVAL_S seconds to avoid
+        hammering the FUSE filesystem with glob+stat calls on every idle tick.
+        """
+        now_mono = time.monotonic()
+        if now_mono - self._last_check < _COMPACT_POLL_INTERVAL_S:
+            return
+        self._last_check = now_mono
+
         now = datetime.now()
         for info in self.sessions.list_sessions():
             key = info.get("key", "")
