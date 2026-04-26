@@ -293,7 +293,13 @@ class TelegramChannel(BaseChannel):
             channel="telegram",
             sender_id="system",
             chat_id=str(chat_id),
-            content="[system] You just started.",
+            content=(
+                "[system] You just started. You MUST re-read the handbook "
+                "(/home/lentan/matron/handbook.md) AND the org chart "
+                "(/home/lentan/matron/state/config.yaml) before doing anything "
+                "else, even if you've read them earlier in this session. They "
+                "may have changed since your last wake. This is non-negotiable."
+            ),
             metadata=metadata,
             session_key_override=session_key,
         )
