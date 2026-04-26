@@ -176,28 +176,49 @@ _STREAM_EDIT_INTERVAL_DEFAULT = 0.6  # min seconds between edit_message_text cal
 # can triage without reading every agent's chat history. Keep this best-effort:
 # it must never break a normal send.
 _HR_INBOX = Path("/matron/workspaces/matron-hr/inbox")
-_ERROR_PATTERN = re.compile(
-    r"\b(?:traceback|exception(?:s)?|error(?:s|ed)?|"
-    r"fail(?:s|ed|ing|ure(?:s)?)?)\b",
-    re.IGNORECASE,
+# Narrow set of patterns deliberately matching only nanobot's actual error
+# emission paths (e.g. _DEFAULT_ERROR_MESSAGE starts with "Sorry, I encountered",
+# provider-retry-exhaustion logs contain "Model request failed", and tool/agent
+# soft-errors are conventionally prefixed with ❌ or ⚠️). High-signal by design;
+# do not widen without re-reviewing the false-positive cost.
+_ERROR_TRIGGERS: tuple[tuple[str, str], ...] = (
+    ("startswith", "Sorry, I encountered"),
+    ("contains",   "Model request failed"),
+    ("startswith", "❌"),
+    ("startswith", "⚠️"),
 )
+
+
+def _is_error_shaped(content: str) -> bool:
+    if not content:
+        return False
+    for kind, needle in _ERROR_TRIGGERS:
+        if kind == "startswith" and content.startswith(needle):
+            return True
+        if kind == "contains" and needle in content:
+            return True
+    return False
 
 
 def _route_error_to_hr_inbox(content: str) -> None:
     """If outbound model content is error-shaped, drop a copy in HR's inbox.
 
     Best-effort. Never raises. Called from TelegramChannel.send for final
-    (non-progress) text replies.
+    (non-progress) text replies. Self-suppresses when the sending agent is
+    matron-hr to avoid a self-notification loop.
     """
-    if not content or not _ERROR_PATTERN.search(content):
+    if not _is_error_shaped(content):
         return
     try:
-        if not _HR_INBOX.is_dir():
-            return
         try:
             agent = getpass.getuser()
         except Exception:
             agent = "unknown-agent"
+        # Self-suppression: HR's own error fan-out must not notify HR.
+        if agent == "matron-hr":
+            return
+        if not _HR_INBOX.is_dir():
+            return
         now = datetime.now(timezone.utc)
         # Microsecond precision in the filename to avoid collisions on bursts.
         ts_file = now.strftime("%Y%m%dT%H%M%S.%fZ")
