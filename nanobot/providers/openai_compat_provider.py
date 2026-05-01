@@ -379,6 +379,7 @@ class OpenAICompatProvider(LLMProvider):
             elif spec.name in (
                 "volcengine", "volcengine_coding_plan",
                 "byteplus", "byteplus_coding_plan",
+                "deepseek",
             ):
                 extra = {
                     "thinking": {"type": "enabled" if thinking_enabled else "disabled"}
@@ -395,6 +396,19 @@ class OpenAICompatProvider(LLMProvider):
             kwargs.setdefault("extra_body", {}).update(
                 {"thinking": {"type": "enabled" if thinking_enabled else "disabled"}}
             )
+
+        # DeepSeek thinking mode 400s if any prior assistant message in history
+        # is missing reasoning_content. Normalize to empty string — model treats
+        # it as "no thinking happened on that turn". Required after enabling
+        # reasoning on a session that pre-dates it.
+        if (
+            spec and spec.name == "deepseek"
+            and reasoning_effort is not None
+            and reasoning_effort.lower() not in ("none", "minimal")
+        ):
+            for msg in kwargs["messages"]:
+                if msg.get("role") == "assistant" and not isinstance(msg.get("reasoning_content"), str):
+                    msg["reasoning_content"] = ""
 
         if tools:
             kwargs["tools"] = tools
