@@ -1,22 +1,31 @@
 """
-Port of tetratorus/ascii-screenshot to Python + RapidOCR.
+Port of tetratorus/ascii-screenshot to Python.
 
 Core algorithm:
-  1. RapidOCR extracts text + bounding boxes
+  1. OCR engine extracts text + bounding boxes (swappable backend)
   2. formatText() places OCR fragments into a monospace character grid
      using their normalized X,Y positions
   3. groupWordsInSentence() merges nearby fragments into words
   4. addLinesToAsciiText() overlays detected visual lines (|, _)
   5. ascii() orchestrates the pipeline
 
+OCR backends:
+  - "rapidocr" — RapidOCR (cross-platform, requires rapidocr-onnxruntime)
+  - "apple"    — macOS Vision framework via osascript (macOS only)
+
 Original JS: https://github.com/tetratorus/ascii-screenshot
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import math
-from typing import Any
+import os
+import re
+import subprocess
+import sys
+from typing import Any, Protocol
 
 import cv2
 import numpy as np
@@ -24,18 +33,25 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 1. OCR adapter — RapidOCR → ascii-screenshot JSON format
+# 1. OCR interface + backends
 # ---------------------------------------------------------------------------
 
-# Lazy-loaded RapidOCR singleton
-_ocr_engine: Any = None
+# Annotation format consumed by the rest of the pipeline:
+#   {text: str, origin: {x: float, y: float}, size: {width: float, height: float}}
+# All coordinates normalized 0–1.
+
+Annotation = dict[str, Any]
+
+
+class OCRBackend(Protocol):
+    """Interface: image path in, list of normalised-bbox annotations out."""
+
+    def run(self, image_path: str) -> list[Annotation] | None: ...
+
+
+# ---- RapidOCR backend -----------------------------------------------------
 
 # Regex for splitting concatenated CamelCase / letter-digit text
-# e.g. "DAcquireNotificatio" → ["D", "Acquire", "Notificatio"]
-#      "NewAl listing" → ["New", "Al", "listing"]
-#      "OneLinersCrypto" → ["One", "Liners", "Crypto"]
-import re
-
 _WORD_SPLIT_RE = re.compile(
     r"(?<=[a-z])(?=[A-Z])"          # lower → upper
     r"|(?<=[A-Z])(?=[A-Z][a-z])"   # upper → upper+lower
@@ -45,117 +61,147 @@ _WORD_SPLIT_RE = re.compile(
 
 
 def _split_concatenated_text(text: str) -> list[str]:
-    """Split RapidOCR concatenated text into word-level fragments.
-
-    Handles "DAcquireNotificatio" → ["D", "Acquire", "Notificatio"]
-    Preserves existing spaces as split boundaries.
-    """
     if not text:
         return []
-    # First split on existing spaces
     parts = text.split()
     result = []
     for part in parts:
-        # Apply CamelCase/digit heuristic
         tokens = _WORD_SPLIT_RE.split(part)
         result.extend([t for t in tokens if t])
     return result
 
 
-def _get_ocr_engine() -> Any:
-    """Return a lazily-initialized RapidOCR instance."""
-    global _ocr_engine
-    if _ocr_engine is None:
-        from rapidocr_onnxruntime import RapidOCR
+class RapidOCRBackend:
+    """RapidOCR via rapidocr-onnxruntime. Cross-platform."""
 
-        _ocr_engine = RapidOCR()
-    return _ocr_engine
+    def __init__(self) -> None:
+        self._engine: Any = None
 
+    def _get_engine(self) -> Any:
+        if self._engine is None:
+            from rapidocr_onnxruntime import RapidOCR
+            self._engine = RapidOCR()
+        return self._engine
 
-def _run_ocr(image_path: str) -> list[dict[str, Any]] | None:
-    """Run RapidOCR and return results in ascii-screenshot JSON format.
+    def run(self, image_path: str) -> list[Annotation] | None:
+        if not os.path.exists(image_path):
+            logger.debug("OCR image not found: %s", image_path)
+            return None
+        try:
+            img = cv2.imread(image_path)
+            if img is None:
+                return None
 
-    Each result: {text, origin: {x, y}, size: {width, height}}
-    All coordinates normalized 0–1.
+            ocr_result, _ = self._get_engine()(img)
+            if not ocr_result:
+                return []
 
-    Returns None on failure.
-    """
-    import os
+            img_h, img_w = img.shape[:2]
+            annotations: list[Annotation] = []
 
-    if not os.path.exists(image_path):
-        logger.debug("OCR image not found: %s", image_path)
-        return None
+            for bbox, text, score in ocr_result:
+                if not text or not bbox:
+                    continue
+                xs = [p[0] for p in bbox]
+                ys = [p[1] for p in bbox]
+                min_x, max_x = min(xs), max(xs)
+                min_y, max_y = min(ys), max(ys)
+                bbox_width = max(max_x - min_x, 1)
 
-    try:
-        img = cv2.imread(image_path)
-        if img is None:
-            logger.debug("OCR cv2.imread returned None for %s", image_path)
+                # Convert to Apple Vision coordinate system (origin = bottom-left, y=0 at bottom)
+                norm_height = (max_y - min_y) / img_h
+                norm_y = 1.0 - max_y / img_h  # bottom-left of bbox in bottom-up coords
+
+                words = _split_concatenated_text(text)
+                if len(words) > 1:
+                    total_len = sum(len(w) for w in words)
+                    x_offset = min_x
+                    for word in words:
+                        word_width = (len(word) / total_len) * bbox_width if total_len > 0 else bbox_width
+                        annotations.append({
+                            "text": word,
+                            "origin": {"x": x_offset / img_w, "y": norm_y},
+                            "size": {"width": word_width / img_w, "height": norm_height},
+                        })
+                        x_offset += word_width
+                else:
+                    annotations.append({
+                        "text": text,
+                        "origin": {"x": min_x / img_w, "y": norm_y},
+                        "size": {"width": (max_x - min_x) / img_w, "height": norm_height},
+                    })
+
+            logger.debug("RapidOCR extracted %d fragments from %s", len(annotations), image_path)
+            return annotations
+        except Exception:
+            logger.debug("RapidOCR failed for %s", image_path, exc_info=True)
             return None
 
-        engine = _get_ocr_engine()
-        ocr_result, _ = engine(img)
 
-        if not ocr_result:
-            logger.debug("OCR produced no results for %s", image_path)
-            return []
+# ---- Apple Vision backend --------------------------------------------------
 
-        img_h, img_w = img.shape[:2]
+class AppleVisionBackend:
+    """macOS Vision framework via osascript. Returns normalised bounding boxes natively."""
 
-        annotations: list[dict[str, Any]] = []
-        for item in ocr_result:
-            bbox, text, score = item
-            if not text or not bbox:
-                continue
-            # bbox is [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] (quadrilateral)
-            xs = [p[0] for p in bbox]
-            ys = [p[1] for p in bbox]
-            min_x = min(xs)
-            max_x = max(xs)
-            min_y = min(ys)
-            max_y = max(ys)
+    def __init__(self, scpt_path: str | None = None) -> None:
+        self._scpt_path = scpt_path
 
-            bbox_width = max_x - min_x
-            if bbox_width <= 0:
-                bbox_width = 1
+    def _find_scpt(self) -> str:
+        if self._scpt_path:
+            return self._scpt_path
+        # Look next to this file, then in common locations
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates = [
+            os.path.join(here, "ocr.scpt"),
+            os.path.join(here, "..", "..", "ocr.scpt"),
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                return c
+        raise FileNotFoundError("ocr.scpt not found — pass scpt_path to AppleVisionBackend")
 
-            # Split multi-word OCR output into per-word annotations
-            # RapidOCR concatenates "DAcquireNotificatio" → split to ["D", "Acquire", "Notificatio"]
-            words = _split_concatenated_text(text)
-            if len(words) > 1:
-                # Distribute bounding box width proportionally by word length
-                total_len = sum(len(w) for w in words)
-                x_offset = min_x
-                for word in words:
-                    word_width = (len(word) / total_len) * bbox_width if total_len > 0 else bbox_width
-                    annotations.append(
-                        {
-                            "text": word,
-                            "origin": {"x": x_offset / img_w, "y": min_y / img_h},
-                            "size": {
-                                "width": word_width / img_w,
-                                "height": (max_y - min_y) / img_h,
-                            },
-                        }
-                    )
-                    x_offset += word_width
-            else:
-                annotations.append(
-                    {
-                        "text": text,
-                        "origin": {"x": min_x / img_w, "y": min_y / img_h},
-                        "size": {
-                            "width": (max_x - min_x) / img_w,
-                            "height": (max_y - min_y) / img_h,
-                        },
-                    }
-                )
+    def run(self, image_path: str) -> list[Annotation] | None:
+        if sys.platform != "darwin":
+            logger.debug("AppleVisionBackend requires macOS")
+            return None
+        if not os.path.exists(image_path):
+            logger.debug("OCR image not found: %s", image_path)
+            return None
+        try:
+            scpt = self._find_scpt()
+            proc = subprocess.run(
+                ["osascript", scpt, image_path],
+                capture_output=True, text=True, timeout=30,
+            )
+            if proc.returncode != 0:
+                logger.debug("osascript failed: %s", proc.stderr)
+                return None
+            # JXA console.log writes to stderr, not stdout
+            output = proc.stderr or proc.stdout
+            annotations: list[Annotation] = json.loads(output)
+            logger.debug("AppleVision extracted %d fragments from %s", len(annotations), image_path)
+            return annotations
+        except Exception:
+            logger.debug("AppleVision failed for %s", image_path, exc_info=True)
+            return None
 
-        logger.debug("OCR extracted %d text fragments from %s", len(annotations), image_path)
-        return annotations
 
-    except Exception:
-        logger.debug("OCR failed for %s", image_path, exc_info=True)
-        return None
+# ---- Backend selection -----------------------------------------------------
+
+_default_backend: OCRBackend | None = None
+
+
+def set_ocr_backend(backend: OCRBackend) -> None:
+    """Set the OCR backend used by ocr_image()."""
+    global _default_backend
+    _default_backend = backend
+
+
+def _get_backend() -> OCRBackend:
+    global _default_backend
+    if _default_backend is None:
+        _default_backend = RapidOCRBackend()
+    return _default_backend
 
 
 # ---------------------------------------------------------------------------
@@ -182,9 +228,11 @@ def format_text(
     for _ in range(canvas_height):
         canvas.append([" "] * canvas_width)
 
-    # Place text, grouped by line
-    sorted_rows = sorted(line_cluster.items(), key=lambda x: x[0])
-    for row_idx, (y_key, line) in enumerate(sorted_rows):
+    # Place text, grouped by line — use y_key as actual row (not enumeration index)
+    for y_key, line in line_cluster.items():
+        row = min(y_key, canvas_height - 1)
+        if row < 0:
+            row = 0
         line.sort(key=lambda a: a["origin"]["x"])
         grouped = group_words_in_sentence(line)
 
@@ -197,15 +245,15 @@ def format_text(
             # Extend canvas if text overflows
             if start_x + len(text) >= canvas_width:
                 for _ in range(len(text) + 1):
-                    canvas[row_idx].append(" ")
+                    canvas[row].append(" ")
 
             for j, ch in enumerate(text):
-                if start_x + j < len(canvas[row_idx]):
-                    canvas[row_idx][start_x + j] = ch
+                if start_x + j < canvas_width:
+                    canvas[row][start_x + j] = ch
 
             last_x = start_x + len(text) + 1  # +1 for inter-word space
 
-    page_text = "\n".join("".join(row) for row in canvas)
+    page_text = "\n".join("".join(row[:canvas_width]) for row in canvas)
     bordered = "_" * canvas_width + "\n" + page_text + "\n" + "_" * canvas_width
     return bordered
 
@@ -555,13 +603,14 @@ def ocr_image(
     image_path: str,
     canvas_width: int = 80,
     canvas_height: int | None = None,
+    backend: OCRBackend | None = None,
 ) -> str | None:
     """Run the full ascii-screenshot pipeline on an image.
 
     Returns the rendered ASCII text, or None if OCR fails.
     This is the function called by image_placeholder_text().
     """
-    ocr_data = _run_ocr(image_path)
+    ocr_data = (backend or _get_backend()).run(image_path)
     if ocr_data is None:
         return None
 
