@@ -88,9 +88,40 @@ def safe_filename(name: str) -> str:
     return _UNSAFE_CHARS.sub("_", name).strip()
 
 
+# ---------------------------------------------------------------------------
+# OCR for non-vision models — RapidOCR pipeline
+# ---------------------------------------------------------------------------
+
+def ocr_image(path: str) -> str | None:
+    """Extract text from an image via the ascii-screenshot pipeline (RapidOCR + spatial canvas).
+
+    Returns the rendered ASCII text or None if OCR fails.
+    """
+    if not path:
+        return None
+    try:
+        from nanobot.utils.ascii_screenshot import ocr_image as _ascii_screenshot_ocr
+        return _ascii_screenshot_ocr(path, canvas_width=80)
+    except Exception:
+        logger.debug("OCR failed for {}", path, exc_info=True)
+        return None
+
+
+_VISION_UNAVAILABLE_NOTE = (
+    "[Note: vision is not available for this model — "
+    "using OCR to extract text from the image]\n\n"
+)
+
+
 def image_placeholder_text(path: str | None, *, empty: str = "[image]") -> str:
-    """Build an image placeholder string."""
-    return f"[image: {path}]" if path else empty
+    """Build an image placeholder string, with OCR fallback."""
+    if not path:
+        return empty
+    ocr_text = ocr_image(path)
+    if ocr_text:
+        return _VISION_UNAVAILABLE_NOTE + ocr_text
+    return f"[image: {path}]"
+
 
 
 def truncate_text(text: str, max_chars: int) -> str:

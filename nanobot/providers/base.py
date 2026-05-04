@@ -680,6 +680,11 @@ class LLMProvider(ABC):
         retry_mode: str,
         on_retry_wait: Callable[[str], Awaitable[None]] | None,
     ) -> LLMResponse:
+        # Proactive strip: text-only providers don't understand image_url blocks
+        if not getattr(self, 'supports_vision', True):
+            stripped = self._strip_image_content(kw["messages"])
+            if stripped is not None:
+                kw["messages"] = stripped
         attempt = 0
         delays = list(self._CHAT_RETRY_DELAYS)
         persistent = retry_mode == "persistent"
