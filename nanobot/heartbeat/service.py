@@ -96,7 +96,9 @@ class HeartbeatService:
                 {"role": "system", "content": "You are a heartbeat agent. Call the heartbeat tool to report your decision."},
                 {"role": "user", "content": (
                     f"Current Time: {current_time_str(self.timezone)}\n\n"
-                    "Review the following HEARTBEAT.md and decide whether there are active tasks.\n\n"
+                    "Review the following HEARTBEAT.md. If the Mandatory section contains tasks, "
+                    "or if the Active Tasks section contains tasks, action must be 'run'. "
+                    "Only skip if the file is truly empty (no tasks in any section).\n\n"
                     f"{content}"
                 )},
             ],
