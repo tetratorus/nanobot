@@ -901,13 +901,20 @@ class AgentRunner:
         if budget <= 0:
             return messages
 
+        # Split the trigger from the drop target. We only fire snip when we're
+        # near the budget ceiling, but when we do snip, we drop down to ~50% so
+        # there's headroom before the next snip. This avoids the failure mode
+        # where we snip every turn and lose ~one message of context each time.
+        trigger_threshold = int(budget * 0.95)
+        drop_target = int(budget * 0.50)
+
         estimate, _ = estimate_prompt_tokens_chain(
             self.provider,
             spec.model,
             messages,
             spec.tools.get_definitions(),
         )
-        if estimate <= budget:
+        if estimate <= trigger_threshold:
             return messages
 
         system_messages = [dict(msg) for msg in messages if msg.get("role") == "system"]
@@ -916,7 +923,7 @@ class AgentRunner:
             return messages
 
         system_tokens = sum(estimate_message_tokens(msg) for msg in system_messages)
-        remaining_budget = max(128, budget - system_tokens)
+        remaining_budget = max(128, drop_target - system_tokens)
         kept: list[dict[str, Any]] = []
         kept_tokens = 0
         for message in reversed(non_system):
@@ -928,10 +935,6 @@ class AgentRunner:
         kept.reverse()
 
         if kept:
-            for i, message in enumerate(kept):
-                if message.get("role") == "user":
-                    kept = kept[i:]
-                    break
             start = find_legal_message_start(kept)
             if start:
                 kept = kept[start:]
@@ -940,6 +943,35 @@ class AgentRunner:
             start = find_legal_message_start(kept)
             if start:
                 kept = kept[start:]
+
+        dropped_count = len(non_system) - len(kept)
+
+        # Inject a synthetic marker so the model knows a snip happened and
+        # where to find the full history (the session JSONL is the source of truth).
+        if dropped_count > 0:
+            session_key = spec.session_key or "default"
+            session_path = (
+                spec.workspace / "sessions" / f"{session_key}.jsonl"
+                if spec.workspace is not None else None
+            )
+            marker_text = (
+                f"[Context window snipped: {dropped_count} older messages dropped "
+                f"(tokens {estimate} > budget {budget})."
+            )
+            if session_path is not None:
+                marker_text += (
+                    f" Older turns are still on disk at {session_path} — "
+                    f"read that file if you need to recall prior tool calls or planning state.]"
+                )
+            else:
+                marker_text += "]"
+            kept = [{"role": "user", "content": marker_text}] + kept
+
+        logger.warning(
+            "snip_history: %d -> %d messages (tokens %d > budget %d) [session=%s]",
+            len(non_system), len(kept), estimate, budget,
+            spec.session_key or "default",
+        )
         return system_messages + kept
 
     def _partition_tool_batches(

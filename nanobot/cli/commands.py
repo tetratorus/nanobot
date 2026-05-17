@@ -474,6 +474,7 @@ def _make_provider(config: Config):
         max_tokens=defaults.max_tokens,
         reasoning_effort=defaults.reasoning_effort,
     )
+    provider.supports_vision = defaults.supports_vision
     return provider
 
 
@@ -752,6 +753,22 @@ def gateway(
 
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
+        # Prefer the configured startup target for Telegram to avoid
+        # mis-routing when stale/wrong-topic sessions exist.
+        telegram = channels.channels.get("telegram")
+        if telegram is not None:
+            cfg = telegram.config
+            if isinstance(cfg, dict):
+                startup_chat_id = cfg.get("startup_chat_id", "")
+                startup_thread_id = cfg.get("startup_thread_id")
+            else:
+                startup_chat_id = getattr(cfg, "startup_chat_id", "")
+                startup_thread_id = getattr(cfg, "startup_thread_id", None)
+            if startup_chat_id:
+                if startup_thread_id is not None:
+                    return "telegram", f"{startup_chat_id}:topic:{startup_thread_id}"
+                return "telegram", startup_chat_id
+
         enabled = set(channels.enabled_channels)
         # Prefer the most recently updated non-internal session on an enabled channel.
         for item in session_manager.list_sessions():
@@ -798,6 +815,25 @@ def gateway(
             return  # No external channel available to deliver to
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
 
+    async def on_heartbeat_deliver(tasks: str) -> None:
+        """Deliver heartbeat tasks as an inbound message via the normal agent loop.
+
+        Uses on_deliver (conservative path) instead of on_execute/on_notify
+        (legacy shadow-session path).  Tasks are injected into the bus as a
+        synthetic InboundMessage and processed through the normal session,
+        giving the agent full context and leaving a visible trace.
+        """
+        from nanobot.bus.events import InboundMessage
+        channel, chat_id = _pick_heartbeat_target()
+        if channel == "cli":
+            return  # No external channel available to deliver to
+        await bus.publish_inbound(InboundMessage(
+            channel=channel,
+            sender_id="system",
+            chat_id=chat_id,
+            content=tasks,
+        ))
+
     hb_cfg = config.gateway.heartbeat
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
@@ -805,6 +841,7 @@ def gateway(
         model=agent.model,
         on_execute=on_heartbeat_execute,
         on_notify=on_heartbeat_notify,
+        on_deliver=on_heartbeat_deliver if hb_cfg.use_deliver else None,
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
         timezone=config.agents.defaults.timezone,

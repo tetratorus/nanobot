@@ -42,6 +42,17 @@ def _tool_hint_to_telegram_blockquote(text: str) -> str:
     return f"<blockquote expandable>{_escape_telegram_html(text)}</blockquote>" if text else ""
 
 
+def _parse_chat_id(chat_id: str | int) -> tuple[int, int | None]:
+    """Parse a chat ID, handling combined -100...:topic:... format."""
+    if isinstance(chat_id, int):
+        return chat_id, None
+    if isinstance(chat_id, str) and ":" in chat_id:
+        parts = chat_id.split(":")
+        if len(parts) >= 3 and parts[1] == "topic":
+            return int(parts[0]), int(parts[2])
+    return int(chat_id), None
+
+
 def _strip_md(s: str) -> str:
     """Strip markdown inline formatting from text."""
     s = re.sub(r'\*\*(.+?)\*\*', r'\1', s)
@@ -363,6 +374,8 @@ class TelegramChannel(BaseChannel):
         if self.config.startup_thread_id is not None:
             metadata["message_thread_id"] = self.config.startup_thread_id
             session_key = f"telegram_{chat_id}_topic_{self.config.startup_thread_id}"
+            # Use combined format so _parse_chat_id extracts topic naturally
+            chat_id = f"{chat_id}:topic:{self.config.startup_thread_id}"
         else:
             session_key = f"telegram_{chat_id}"
         return InboundMessage(
@@ -519,13 +532,9 @@ class TelegramChannel(BaseChannel):
                 except ValueError:
                     pass
 
-        try:
-            chat_id = int(msg.chat_id)
-        except ValueError:
-            logger.error("Invalid chat_id: {}", msg.chat_id)
-            return
+        chat_id, parsed_thread_id = _parse_chat_id(msg.chat_id)
         reply_to_message_id = msg.metadata.get("message_id")
-        message_thread_id = msg.metadata.get("message_thread_id")
+        message_thread_id = parsed_thread_id if parsed_thread_id is not None else msg.metadata.get("message_thread_id")
         if message_thread_id is None and reply_to_message_id is not None:
             message_thread_id = self._message_threads.get((msg.chat_id, reply_to_message_id))
         thread_kwargs = {}
@@ -663,7 +672,7 @@ class TelegramChannel(BaseChannel):
         if not self._app:
             return
         meta = metadata or {}
-        int_chat_id = int(chat_id)
+        int_chat_id, parsed_thread_id = _parse_chat_id(chat_id)
         stream_id = meta.get("_stream_id")
 
         if meta.get("_stream_end"):
@@ -728,7 +737,8 @@ class TelegramChannel(BaseChannel):
 
         now = time.monotonic()
         thread_kwargs = {}
-        if message_thread_id := meta.get("message_thread_id"):
+        message_thread_id = parsed_thread_id if parsed_thread_id is not None else meta.get("message_thread_id")
+        if message_thread_id:
             thread_kwargs["message_thread_id"] = message_thread_id
         if buf.message_id is None:
             try:
@@ -971,6 +981,9 @@ class TelegramChannel(BaseChannel):
         user = update.effective_user
         self._remember_thread_context(message)
         
+        if not await self._is_group_message_for_bot(message):
+            return
+        
         # Strip @bot_username suffix if present
         content = message.text or ""
         if content.startswith("/") and "@" in content:
@@ -1115,8 +1128,9 @@ class TelegramChannel(BaseChannel):
         if not self._app or not emoji:
             return
         try:
+            parsed_chat_id, _ = _parse_chat_id(chat_id)
             await self._app.bot.set_message_reaction(
-                chat_id=int(chat_id),
+                chat_id=parsed_chat_id,
                 message_id=message_id,
                 reaction=[ReactionTypeEmoji(emoji=emoji)],
             )
@@ -1128,8 +1142,9 @@ class TelegramChannel(BaseChannel):
         if not self._app:
             return
         try:
+            parsed_chat_id, _ = _parse_chat_id(chat_id)
             await self._app.bot.set_message_reaction(
-                chat_id=int(chat_id),
+                chat_id=parsed_chat_id,
                 message_id=message_id,
                 reaction=[],
             )
@@ -1139,8 +1154,9 @@ class TelegramChannel(BaseChannel):
     async def _typing_loop(self, chat_id: str) -> None:
         """Repeatedly send 'typing' action until cancelled."""
         try:
+            parsed_chat_id, _ = _parse_chat_id(chat_id)
             while self._app:
-                await self._app.bot.send_chat_action(chat_id=int(chat_id), action="typing")
+                await self._app.bot.send_chat_action(chat_id=parsed_chat_id, action="typing")
                 await asyncio.sleep(4)
         except asyncio.CancelledError:
             pass

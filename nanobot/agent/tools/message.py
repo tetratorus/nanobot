@@ -67,8 +67,9 @@ class MessageTool(Tool):
     def description(self) -> str:
         return (
             "Send a message to the user, optionally with file attachments. "
-            "This is the ONLY way to deliver files (images, documents, audio, video) to the user. "
-            "Use the 'media' parameter with file paths to attach files. "
+            "For normal text replies, just write your response naturally — the system delivers it automatically. "
+            "ONLY use this tool for: (1) sending files via the 'media' parameter, or (2) mid-turn updates "
+            "when you need to notify the user before your final response. "
             "Do NOT use read_file to send files — that only reads content for your own analysis."
         )
 

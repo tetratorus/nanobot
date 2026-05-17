@@ -1,6 +1,7 @@
 """Session management for conversation history."""
 
 import json
+import re
 import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -136,8 +137,82 @@ class SessionManager:
         self._cache[key] = session
         return session
 
+
+    def _get_bot_username(self) -> str | None:
+        """Extract bot username from nanobot.json api_base URL."""
+        try:
+            config_path = self.workspace / "nanobot.json"
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            defaults = config.get("agents", {}).get("defaults", {})
+            provider_name = defaults.get("provider", "")
+            provider = config.get("providers", {}).get(provider_name, {})
+            api_base = provider.get("api_base", "")
+            match = re.search(r"/([^/]+_bot)/", api_base)
+            if match:
+                return match.group(1)
+        except Exception:
+            pass
+        return None
+
+    def _load_from_llmproxy(self, key: str) -> Session | None:
+        """Load session from llmproxy database — pure text dump, zero parsing."""
+        try:
+            import os
+            import sqlite3
+            from datetime import datetime as _dt
+
+            bot_username = self._get_bot_username()
+            if not bot_username:
+                return None
+
+            db_path = os.environ.get("LLMPROXY_DB", "/home/lentan/llmproxy/requests.db")
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                SELECT body, response, timestamp
+                FROM requests
+                WHERE agent = ? AND response IS NOT NULL
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                (bot_username,),
+            )
+            row = cursor.fetchone()
+            conn.close()
+
+            if not row:
+                return None
+
+            body_text, response_text, timestamp = row
+
+            # Pure text dump — no parsing, no filtering, no reconstruction
+            raw_log = f"""[llmproxy log at {timestamp}]
+
+--- REQUEST BODY ---
+{body_text}
+
+--- RESPONSE ---
+{response_text}
+"""
+
+            return Session(
+                key=key,
+                messages=[{"role": "user", "content": raw_log}],
+                created_at=_dt.now(),
+                updated_at=_dt.now(),
+            )
+        except Exception as e:
+            logger.warning("Failed to load session from llmproxy: {}", e)
+            return None
+
     def _load(self, key: str) -> Session | None:
-        """Load a session from disk."""
+        """Load a session from llmproxy or disk."""
+        session = self._load_from_llmproxy(key)
+        if session is not None:
+            return session
         path = self._get_session_path(key)
         if not path.exists():
             legacy_path = self._get_legacy_session_path(key)

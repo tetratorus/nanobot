@@ -22,7 +22,16 @@ def _now_ms() -> int:
 def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
     """Compute next run time in ms."""
     if schedule.kind == "at":
-        return schedule.at_ms if schedule.at_ms and schedule.at_ms > now_ms else None
+        if not schedule.at_ms:
+            return None
+        # 5-minute grace window: if the scheduled time is in the past but within
+        # the last 5 minutes, return now so it fires immediately. Else the job was
+        # created minutes/hours/days ago and should be skipped.
+        if schedule.at_ms <= now_ms < schedule.at_ms + 300_000:
+            return now_ms
+        if schedule.at_ms > now_ms:
+            return schedule.at_ms
+        return None
 
     if schedule.kind == "every":
         if not schedule.every_ms or schedule.every_ms <= 0:
