@@ -655,16 +655,38 @@ class Dream:
             len(entries), last_cursor, batch[-1]["cursor"], len(batch),
         )
 
-        # Build history text for LLM
-        history_text = "\n".join(
-            f"[{e['timestamp']}] {e['content']}" for e in batch
-        )
+        # Build history text for LLM — truncate individual entries and total
+        # to prevent the model from burning all completion tokens on reasoning.
+        _MAX_ENTRY_CHARS = 2_000
+        _MAX_HISTORY_CHARS = 15_000
+        entry_texts: list[str] = []
+        total = 0
+        for e in batch:
+            content = e["content"]
+            if len(content) > _MAX_ENTRY_CHARS:
+                content = content[:_MAX_ENTRY_CHARS] + " [truncated]"
+            line = f"[{e['timestamp']}] {content}"
+            if total + len(line) > _MAX_HISTORY_CHARS:
+                remaining = _MAX_HISTORY_CHARS - total
+                if remaining > 0:
+                    entry_texts.append(line[:remaining] + " [truncated]")
+                break
+            entry_texts.append(line)
+            total += len(line)
+        history_text = "\n".join(entry_texts)
 
-        # Current file contents
+        # Current file contents — cap each to avoid bloating the prompt
+        _MAX_FILE_CHARS = 5_000
         current_date = datetime.now().strftime("%Y-%m-%d")
         current_memory = self.store.read_memory() or "(empty)"
+        if len(current_memory) > _MAX_FILE_CHARS:
+            current_memory = current_memory[:_MAX_FILE_CHARS] + "\n[truncated]"
         current_soul = self.store.read_soul() or "(empty)"
+        if len(current_soul) > _MAX_FILE_CHARS:
+            current_soul = current_soul[:_MAX_FILE_CHARS] + "\n[truncated]"
         current_user = self.store.read_user() or "(empty)"
+        if len(current_user) > _MAX_FILE_CHARS:
+            current_user = current_user[:_MAX_FILE_CHARS] + "\n[truncated]"
 
         file_context = (
             f"## Current Date\n{current_date}\n\n"
