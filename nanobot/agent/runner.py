@@ -40,6 +40,7 @@ _MAX_INJECTION_CYCLES = 5
 _SNIP_SAFETY_BUFFER = 1024
 _MICROCOMPACT_KEEP_RECENT = 10
 _MICROCOMPACT_MIN_CHARS = 500
+_MAX_MESSAGE_CHARS = 200_000
 _COMPACTABLE_TOOLS = frozenset({
     "read_file", "exec", "grep", "glob",
     "web_search", "web_fetch", "list_dir",
@@ -533,6 +534,45 @@ class AgentRunner:
             had_injections=had_injections,
         )
 
+    def _truncate_messages(
+        self,
+        messages: list[dict[str, Any]],
+        max_chars: int = _MAX_MESSAGE_CHARS,
+    ) -> list[dict[str, Any]]:
+        """Truncate individual messages to prevent a single huge input from
+        blowing past the model's token limit.  Preserves structure (string
+        or list-of-parts content)."""
+        truncated: list[dict[str, Any]] = []
+        for msg in messages:
+            msg = dict(msg)
+            content = msg.get("content")
+            if isinstance(content, str) and len(content) > max_chars:
+                msg["content"] = (
+                    content[:max_chars]
+                    + f"\n\n[Message truncated from {len(content):,} to {max_chars:,} characters]"
+                )
+            elif isinstance(content, list):
+                new_parts: list[dict[str, Any]] = []
+                total = 0
+                for part in content:
+                    part = dict(part)
+                    text = part.get("text", "")
+                    if total + len(text) > max_chars:
+                        remaining = max_chars - total
+                        if remaining > 0:
+                            part["text"] = text[:remaining]
+                            new_parts.append(part)
+                        new_parts.append({
+                            "type": "text",
+                            "text": f"\n[Message truncated from {sum(len(p.get('text','')) for p in content):,} to {max_chars:,} characters]",
+                        })
+                        break
+                    new_parts.append(part)
+                    total += len(text)
+                msg["content"] = new_parts
+            truncated.append(msg)
+        return truncated
+
     def _build_request_kwargs(
         self,
         spec: AgentRunSpec,
@@ -540,6 +580,7 @@ class AgentRunner:
         *,
         tools: list[dict[str, Any]] | None,
     ) -> dict[str, Any]:
+        messages = self._truncate_messages(messages)
         kwargs: dict[str, Any] = {
             "messages": messages,
             "tools": tools,

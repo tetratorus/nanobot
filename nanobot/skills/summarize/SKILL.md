@@ -35,6 +35,10 @@ summarize "https://youtu.be/dQw4w9WgXcQ" --youtube auto --extract-only
 
 If the user asked for a transcript but it’s huge, return a tight summary first, then ask which section/time range to expand.
 
+## Input size limits
+
+If the input text exceeds ~200,000 characters, truncate it before summarizing and tell the user how much was omitted. Models have token limits (typically 262K tokens ≈ ~1M characters total context), and passing the entire text in one go will crash with a 400 error. Summarize the first 200K characters, then offer to process the rest in chunks if needed.
+
 ## Model + keys
 
 Set the API key for your chosen provider:
