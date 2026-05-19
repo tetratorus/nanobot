@@ -712,6 +712,7 @@ class Dream:
                 ],
                 tools=None,
                 tool_choice=None,
+                max_tokens=2048,
             )
             analysis = phase1_response.content or ""
             logger.debug("Dream Phase 1 analysis ({} chars): {}", len(analysis), analysis[:500])
