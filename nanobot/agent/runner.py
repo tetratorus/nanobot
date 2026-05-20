@@ -3,25 +3,41 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
 import inspect
+import os
+from contextlib import suppress
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
-from nanobot.utils.prompt_templates import render_template
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.providers.base import LLMProvider, ToolCallRequest
+from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.utils.file_edit_events import (
+    build_file_edit_end_event,
+    build_file_edit_error_event,
+    build_file_edit_start_event,
+    prepare_file_edit_tracker,
+    StreamingFileEditTracker,
+)
 from nanobot.utils.helpers import (
+    IncrementalThinkExtractor,
     build_assistant_message,
     estimate_message_tokens,
     estimate_prompt_tokens_chain,
+    extract_reasoning,
     find_legal_message_start,
     maybe_persist_tool_result,
+    strip_think,
     truncate_text,
 )
+from nanobot.utils.progress_events import (
+    invoke_file_edit_progress,
+    on_progress_accepts_file_edit_events,
+)
+from nanobot.utils.prompt_templates import render_template
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
     build_finalization_retry_message,
@@ -29,6 +45,7 @@ from nanobot.utils.runtime import (
     ensure_nonempty_tool_result,
     is_blank_text,
     repeated_external_lookup_error,
+    repeated_workspace_violation_error,
 )
 
 _DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model."
@@ -40,9 +57,8 @@ _MAX_INJECTION_CYCLES = 5
 _SNIP_SAFETY_BUFFER = 1024
 _MICROCOMPACT_KEEP_RECENT = 10
 _MICROCOMPACT_MIN_CHARS = 500
-_MAX_MESSAGE_CHARS = 200_000
 _COMPACTABLE_TOOLS = frozenset({
-    "read_file", "exec", "grep", "glob",
+    "read_file", "exec", "grep",
     "web_search", "web_fetch", "list_dir",
 })
 _BACKFILL_CONTENT = "[Tool result unavailable — call was interrupted or lost]"
@@ -72,8 +88,11 @@ class AgentRunSpec:
     context_block_limit: int | None = None
     provider_retry_mode: str = "standard"
     progress_callback: Any | None = None
+    stream_progress_deltas: bool = True
+    retry_wait_callback: Any | None = None
     checkpoint_callback: Any | None = None
     injection_callback: Any | None = None
+    llm_timeout_s: float | None = None
 
 
 @dataclass(slots=True)
@@ -234,6 +253,8 @@ class AgentRunner:
         stop_reason = "completed"
         tool_events: list[dict[str, str]] = []
         external_lookup_counts: dict[str, int] = {}
+        # Per-turn throttle for repeated attempts against the same outside target.
+        workspace_violation_counts: dict[str, int] = {}
         empty_content_retries = 0
         length_recovery_count = 0
         had_injections = False
@@ -253,12 +274,11 @@ class AgentRunner:
                 # Snipping may have created new orphans; clean them up.
                 messages_for_model = self._drop_orphan_tool_results(messages_for_model)
                 messages_for_model = self._backfill_missing_tool_results(messages_for_model)
-            except Exception as exc:
-                logger.warning(
-                    "Context governance failed on turn {} for {}: {}; applying minimal repair",
+            except Exception:
+                logger.exception(
+                    "Context governance failed on turn {} for {}; applying minimal repair",
                     iteration,
                     spec.session_key or "default",
-                    exc,
                 )
                 try:
                     messages_for_model = self._drop_orphan_tool_results(messages)
@@ -274,7 +294,19 @@ class AgentRunner:
             context.tool_calls = list(response.tool_calls)
             self._accumulate_usage(usage, raw_usage)
 
-            if response.has_tool_calls:
+            reasoning_text, cleaned_content = extract_reasoning(
+                response.reasoning_content,
+                response.thinking_blocks,
+                response.content,
+            )
+            response.content = cleaned_content
+            if reasoning_text and not context.streamed_reasoning:
+                await hook.emit_reasoning(reasoning_text)
+                await hook.emit_reasoning_end()
+                context.streamed_reasoning = True
+
+            if response.should_execute_tools:
+                context.tool_calls = list(response.tool_calls)
                 if hook.wants_streaming():
                     await hook.on_stream_end(context, resuming=True)
 
@@ -304,6 +336,7 @@ class AgentRunner:
                     spec,
                     response.tool_calls,
                     external_lookup_counts,
+                    workspace_violation_counts,
                 )
                 tool_events.extend(new_events)
                 context.tool_results = list(results)
@@ -362,6 +395,13 @@ class AgentRunner:
                     had_injections = True
                 await hook.after_iteration(context)
                 continue
+
+            if response.has_tool_calls:
+                logger.warning(
+                    "Ignoring tool calls under finish_reason='{}' for {}",
+                    response.finish_reason,
+                    spec.session_key or "default",
+                )
 
             clean = hook.finalize_content(context, response.content)
             if response.finish_reason != "error" and is_blank_text(clean):
@@ -534,45 +574,6 @@ class AgentRunner:
             had_injections=had_injections,
         )
 
-    def _truncate_messages(
-        self,
-        messages: list[dict[str, Any]],
-        max_chars: int = _MAX_MESSAGE_CHARS,
-    ) -> list[dict[str, Any]]:
-        """Truncate individual messages to prevent a single huge input from
-        blowing past the model's token limit.  Preserves structure (string
-        or list-of-parts content)."""
-        truncated: list[dict[str, Any]] = []
-        for msg in messages:
-            msg = dict(msg)
-            content = msg.get("content")
-            if isinstance(content, str) and len(content) > max_chars:
-                msg["content"] = (
-                    content[:max_chars]
-                    + f"\n\n[Message truncated from {len(content):,} to {max_chars:,} characters]"
-                )
-            elif isinstance(content, list):
-                new_parts: list[dict[str, Any]] = []
-                total = 0
-                for part in content:
-                    part = dict(part)
-                    text = part.get("text", "")
-                    if total + len(text) > max_chars:
-                        remaining = max_chars - total
-                        if remaining > 0:
-                            part["text"] = text[:remaining]
-                            new_parts.append(part)
-                        new_parts.append({
-                            "type": "text",
-                            "text": f"\n[Message truncated from {sum(len(p.get('text','')) for p in content):,} to {max_chars:,} characters]",
-                        })
-                        break
-                    new_parts.append(part)
-                    total += len(text)
-                msg["content"] = new_parts
-            truncated.append(msg)
-        return truncated
-
     def _build_request_kwargs(
         self,
         spec: AgentRunSpec,
@@ -580,13 +581,12 @@ class AgentRunner:
         *,
         tools: list[dict[str, Any]] | None,
     ) -> dict[str, Any]:
-        messages = self._truncate_messages(messages)
         kwargs: dict[str, Any] = {
             "messages": messages,
             "tools": tools,
             "model": spec.model,
             "retry_mode": spec.provider_retry_mode,
-            "on_retry_wait": spec.progress_callback,
+            "on_retry_wait": spec.retry_wait_callback,
         }
         if spec.temperature is not None:
             kwargs["temperature"] = spec.temperature
@@ -603,20 +603,136 @@ class AgentRunner:
         hook: AgentHook,
         context: AgentHookContext,
     ):
+        timeout_s: float | None = spec.llm_timeout_s
+        if timeout_s is None:
+            # Default to a finite timeout to avoid per-session lock starvation when an LLM
+            # request hangs indefinitely (e.g. gateway/network stall).
+            # Set NANOBOT_LLM_TIMEOUT_S=0 to disable.
+            raw = os.environ.get("NANOBOT_LLM_TIMEOUT_S", "300").strip()
+            try:
+                timeout_s = float(raw)
+            except (TypeError, ValueError):
+                timeout_s = 300.0
+        if timeout_s is not None and timeout_s <= 0:
+            timeout_s = None
+
         kwargs = self._build_request_kwargs(
             spec,
             messages,
             tools=spec.tools.get_definitions(),
         )
-        if hook.wants_streaming():
+        wants_streaming = hook.wants_streaming()
+        wants_progress_streaming = (
+            not wants_streaming
+            and spec.stream_progress_deltas
+            and spec.progress_callback is not None
+            and getattr(self.provider, "supports_progress_deltas", False) is True
+        )
+
+        progress_state: dict[str, bool] | None = None
+        live_file_edits: StreamingFileEditTracker | None = None
+
+        if (
+            spec.progress_callback is not None
+            and on_progress_accepts_file_edit_events(spec.progress_callback)
+        ):
+            async def _emit_live_file_edits(events: list[dict[str, Any]]) -> None:
+                await invoke_file_edit_progress(spec.progress_callback, events)
+
+            live_file_edits = StreamingFileEditTracker(
+                workspace=spec.workspace,
+                tools=spec.tools,
+                emit=_emit_live_file_edits,
+            )
+
+        async def _tool_call_delta(delta: dict[str, Any]) -> None:
+            if live_file_edits is not None:
+                await live_file_edits.update(delta)
+
+        if wants_streaming:
             async def _stream(delta: str) -> None:
+                if delta:
+                    context.streamed_content = True
                 await hook.on_stream(context, delta)
 
-            return await self.provider.chat_stream_with_retry(
+            async def _thinking(delta: str) -> None:
+                if not delta:
+                    return
+                context.streamed_reasoning = True
+                await hook.emit_reasoning(delta)
+
+            coro = self.provider.chat_stream_with_retry(
                 **kwargs,
                 on_content_delta=_stream,
+                on_thinking_delta=_thinking,
+                on_tool_call_delta=_tool_call_delta if live_file_edits is not None else None,
             )
-        return await self.provider.chat_with_retry(**kwargs)
+        elif wants_progress_streaming:
+            stream_buf = ""
+            think_extractor = IncrementalThinkExtractor()
+            progress_state = {"reasoning_open": False}
+
+            async def _stream_progress(delta: str) -> None:
+                nonlocal stream_buf
+                if not delta:
+                    return
+                prev_clean = strip_think(stream_buf)
+                stream_buf += delta
+                new_clean = strip_think(stream_buf)
+                incremental = new_clean[len(prev_clean):]
+
+                if await think_extractor.feed(stream_buf, hook.emit_reasoning):
+                    context.streamed_reasoning = True
+                    progress_state["reasoning_open"] = True
+
+                if incremental:
+                    if progress_state["reasoning_open"]:
+                        await hook.emit_reasoning_end()
+                        progress_state["reasoning_open"] = False
+                    context.streamed_content = True
+                    await spec.progress_callback(incremental)
+
+            coro = self.provider.chat_stream_with_retry(
+                **kwargs,
+                on_content_delta=_stream_progress,
+                on_tool_call_delta=_tool_call_delta if live_file_edits is not None else None,
+            )
+        else:
+            coro = self.provider.chat_with_retry(**kwargs)
+
+        # Streaming requests already have provider-level idle timeouts
+        # (NANOBOT_STREAM_IDLE_TIMEOUT_S). Do not also apply the outer wall-clock
+        # LLM timeout here, or healthy long reasoning streams can be killed just
+        # because total elapsed time exceeded NANOBOT_LLM_TIMEOUT_S.
+        outer_timeout_s = None if (wants_streaming or wants_progress_streaming) else timeout_s
+        try:
+            response = (
+                await coro if outer_timeout_s is None
+                else await asyncio.wait_for(coro, timeout=outer_timeout_s)
+            )
+            if live_file_edits is not None:
+                await live_file_edits.flush()
+                if response.should_execute_tools:
+                    live_file_edits.apply_final_call_ids(response.tool_calls)
+                await live_file_edits.error_unmatched(
+                    response.tool_calls if response.should_execute_tools else [],
+                    "Tool call did not complete.",
+                )
+        except asyncio.TimeoutError:
+            if outer_timeout_s is None:
+                return LLMResponse(
+                    content="Error calling LLM: stream stalled",
+                    finish_reason="error",
+                    error_kind="timeout",
+                )
+            return LLMResponse(
+                content=f"Error calling LLM: timed out after {outer_timeout_s:g}s",
+                finish_reason="error",
+                error_kind="timeout",
+            )
+        if progress_state and progress_state.get("reasoning_open"):
+            await hook.emit_reasoning_end()
+        return response
 
     async def _request_finalization_retry(
         self,
@@ -657,18 +773,27 @@ class AgentRunner:
         spec: AgentRunSpec,
         tool_calls: list[ToolCallRequest],
         external_lookup_counts: dict[str, int],
+        workspace_violation_counts: dict[str, int],
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
         batches = self._partition_tool_batches(spec, tool_calls)
         tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
         for batch in batches:
             if spec.concurrent_tools and len(batch) > 1:
-                tool_results.extend(await asyncio.gather(*(
-                    self._run_tool(spec, tool_call, external_lookup_counts)
+                batch_results = await asyncio.gather(*(
+                    self._run_tool(
+                        spec, tool_call, external_lookup_counts, workspace_violation_counts,
+                    )
                     for tool_call in batch
-                )))
+                ))
+                tool_results.extend(batch_results)
             else:
+                batch_results = []
                 for tool_call in batch:
-                    tool_results.append(await self._run_tool(spec, tool_call, external_lookup_counts))
+                    result = await self._run_tool(
+                        spec, tool_call, external_lookup_counts, workspace_violation_counts,
+                    )
+                    tool_results.append(result)
+                    batch_results.append(result)
 
         results: list[Any] = []
         events: list[dict[str, str]] = []
@@ -685,8 +810,9 @@ class AgentRunner:
         spec: AgentRunSpec,
         tool_call: ToolCallRequest,
         external_lookup_counts: dict[str, int],
+        workspace_violation_counts: dict[str, int],
     ) -> tuple[Any, dict[str, str], BaseException | None]:
-        _HINT = "\n\n[Analyze the error above and try a different approach.]"
+        hint = "\n\n[Analyze the error above and try a different approach.]"
         lookup_error = repeated_external_lookup_error(
             tool_call.name,
             tool_call.arguments,
@@ -699,24 +825,57 @@ class AgentRunner:
                 "detail": "repeated external lookup blocked",
             }
             if spec.fail_on_tool_error:
-                return lookup_error + _HINT, event, RuntimeError(lookup_error)
-            return lookup_error + _HINT, event, None
+                return lookup_error + hint, event, RuntimeError(lookup_error)
+            return lookup_error + hint, event, None
         prepare_call = getattr(spec.tools, "prepare_call", None)
         tool, params, prep_error = None, tool_call.arguments, None
         if callable(prepare_call):
-            try:
+            with suppress(Exception):
                 prepared = prepare_call(tool_call.name, tool_call.arguments)
                 if isinstance(prepared, tuple) and len(prepared) == 3:
                     tool, params, prep_error = prepared
-            except Exception:
-                pass
         if prep_error:
             event = {
                 "name": tool_call.name,
                 "status": "error",
                 "detail": prep_error.split(": ", 1)[-1][:120],
             }
-            return prep_error + _HINT, event, RuntimeError(prep_error) if spec.fail_on_tool_error else None
+            handled = self._classify_violation(
+                raw_text=prep_error,
+                soft_payload=prep_error + hint,
+                event=event,
+                tool_call=tool_call,
+                workspace_violation_counts=workspace_violation_counts,
+            )
+            if handled is not None:
+                return handled
+            return prep_error + hint, event, (
+                RuntimeError(prep_error) if spec.fail_on_tool_error else None
+            )
+        emit_file_edit_events = (
+            spec.progress_callback is not None
+            and on_progress_accepts_file_edit_events(spec.progress_callback)
+        )
+        progress_callback = spec.progress_callback if emit_file_edit_events else None
+        file_edit_tracker = (
+            prepare_file_edit_tracker(
+                call_id=tool_call.id,
+                tool_name=tool_call.name,
+                tool=tool,
+                workspace=spec.workspace,
+                params=params if isinstance(params, dict) else None,
+            )
+            if progress_callback is not None
+            else None
+        )
+        if file_edit_tracker is not None and progress_callback is not None:
+            await invoke_file_edit_progress(
+                progress_callback,
+                [build_file_edit_start_event(
+                    file_edit_tracker,
+                    params if isinstance(params, dict) else None,
+                )],
+            )
         try:
             if tool is not None:
                 result = await tool.execute(**params)
@@ -725,24 +884,63 @@ class AgentRunner:
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
+            if file_edit_tracker is not None and progress_callback is not None:
+                await invoke_file_edit_progress(
+                    progress_callback,
+                    [build_file_edit_error_event(file_edit_tracker, str(exc))],
+                )
             event = {
                 "name": tool_call.name,
                 "status": "error",
                 "detail": str(exc),
             }
+            payload = f"Error: {type(exc).__name__}: {exc}"
+            handled = self._classify_violation(
+                raw_text=str(exc),
+                # Preserve legacy exception payloads without the retry hint.
+                soft_payload=payload,
+                event=event,
+                tool_call=tool_call,
+                workspace_violation_counts=workspace_violation_counts,
+            )
+            if handled is not None:
+                return handled
             if spec.fail_on_tool_error:
-                return f"Error: {type(exc).__name__}: {exc}", event, exc
-            return f"Error: {type(exc).__name__}: {exc}", event, None
+                return payload, event, exc
+            return payload, event, None
 
         if isinstance(result, str) and result.startswith("Error"):
+            if file_edit_tracker is not None and progress_callback is not None:
+                await invoke_file_edit_progress(
+                    progress_callback,
+                    [build_file_edit_error_event(file_edit_tracker, result)],
+                )
             event = {
                 "name": tool_call.name,
                 "status": "error",
                 "detail": result.replace("\n", " ").strip()[:120],
             }
+            handled = self._classify_violation(
+                raw_text=result,
+                soft_payload=result + hint,
+                event=event,
+                tool_call=tool_call,
+                workspace_violation_counts=workspace_violation_counts,
+            )
+            if handled is not None:
+                return handled
             if spec.fail_on_tool_error:
-                return result + _HINT, event, RuntimeError(result)
-            return result + _HINT, event, None
+                return result + hint, event, RuntimeError(result)
+            return result + hint, event, None
+
+        if file_edit_tracker is not None and progress_callback is not None:
+            await invoke_file_edit_progress(
+                progress_callback,
+                [build_file_edit_end_event(
+                    file_edit_tracker,
+                    params if isinstance(params, dict) else None,
+                )],
+            )
 
         detail = "" if result is None else str(result)
         detail = detail.replace("\n", " ").strip()
@@ -751,6 +949,98 @@ class AgentRunner:
         elif len(detail) > 120:
             detail = detail[:120] + "..."
         return result, {"name": tool_call.name, "status": "ok", "detail": detail}, None
+
+    # SSRF is a hard security block at the tool boundary, but the agent turn
+    # should recover conversationally instead of aborting the runtime.
+    _SSRF_MARKERS: tuple[str, ...] = (
+        "internal/private url detected",
+        "private/internal address",
+        "private address",
+    )
+    _SSRF_BOUNDARY_NOTE: str = (
+        "This is a non-bypassable security boundary. Stop trying to access "
+        "private/internal URLs. Do not retry with curl, wget, encoded IPs, "
+        "alternate DNS, redirects, proxies, or another tool. Ask the user for "
+        "local files, logs, screenshots, or an explicit safe public URL instead. "
+        "If the user explicitly trusts this private URL, ask them to whitelist "
+        "the exact IP/CIDR via tools.ssrfWhitelist."
+    )
+
+    # Non-SSRF boundary markers returned to the LLM as recoverable tool errors.
+    _WORKSPACE_VIOLATION_MARKERS: tuple[str, ...] = (
+        "outside the configured workspace",
+        "outside allowed directory",
+        "working_dir is outside",
+        "working_dir could not be resolved",
+        "path outside working dir",
+        "path traversal detected",
+    )
+
+    @classmethod
+    def _is_ssrf_violation(cls, text: str) -> bool:
+        if not text:
+            return False
+        lowered = text.lower()
+        return any(marker in lowered for marker in cls._SSRF_MARKERS)
+
+    @classmethod
+    def _is_workspace_violation(cls, text: str) -> bool:
+        """True when *text* looks like any policy boundary rejection."""
+        if not text:
+            return False
+        lowered = text.lower()
+        if cls._is_ssrf_violation(lowered):
+            return True
+        return any(marker in lowered for marker in cls._WORKSPACE_VIOLATION_MARKERS)
+
+    def _classify_violation(
+        self,
+        *,
+        raw_text: str,
+        soft_payload: str,
+        event: dict[str, str],
+        tool_call: ToolCallRequest,
+        workspace_violation_counts: dict[str, int],
+    ) -> tuple[Any, dict[str, str], BaseException | None] | None:
+        """Classify safety-boundary failures, or return ``None`` to pass through."""
+        if self._is_ssrf_violation(raw_text):
+            logger.warning(
+                "Tool {} blocked by SSRF guard; returning non-retryable tool error: {}",
+                tool_call.name,
+                raw_text.replace("\n", " ").strip()[:200],
+            )
+            event["detail"] = self._event_detail("ssrf_violation: ", raw_text)
+            return self._ssrf_soft_payload(raw_text), event, None
+
+        if self._is_workspace_violation(raw_text):
+            escalation = repeated_workspace_violation_error(
+                tool_call.name,
+                tool_call.arguments,
+                workspace_violation_counts,
+            )
+            event["detail"] = self._event_detail("workspace_violation: ", raw_text)
+            if escalation is not None:
+                logger.warning(
+                    "Tool {} hit workspace boundary repeatedly; escalating hint",
+                    tool_call.name,
+                )
+                event["detail"] = self._event_detail(
+                    "workspace_violation_escalated: ",
+                    raw_text,
+                )
+                return escalation, event, None
+            return soft_payload, event, None
+
+        return None
+
+    @classmethod
+    def _ssrf_soft_payload(cls, raw_text: str) -> str:
+        text = raw_text.strip() or "Error: request blocked by SSRF guard"
+        return f"{text}\n\n{cls._SSRF_BOUNDARY_NOTE}"
+
+    @staticmethod
+    def _event_detail(prefix: str, text: str, limit: int = 160) -> str:
+        return (prefix + text.replace("\n", " ").strip())[:limit]
 
     async def _emit_checkpoint(
         self,
@@ -798,12 +1088,11 @@ class AgentRunner:
                 result,
                 max_chars=spec.max_tool_result_chars,
             )
-        except Exception as exc:
-            logger.warning(
-                "Tool result persist failed for {} in {}: {}; using raw result",
+        except Exception:
+            logger.exception(
+                "Tool result persist failed for {} in {}; using raw result",
                 tool_call_id,
                 spec.session_key or "default",
-                exc,
             )
             content = result
         if isinstance(content, str) and len(content) > spec.max_tool_result_chars:
@@ -942,20 +1231,13 @@ class AgentRunner:
         if budget <= 0:
             return messages
 
-        # Split the trigger from the drop target. We only fire snip when we're
-        # near the budget ceiling, but when we do snip, we drop down to ~50% so
-        # there's headroom before the next snip. This avoids the failure mode
-        # where we snip every turn and lose ~one message of context each time.
-        trigger_threshold = int(budget * 0.95)
-        drop_target = int(budget * 0.50)
-
         estimate, _ = estimate_prompt_tokens_chain(
             self.provider,
             spec.model,
             messages,
             spec.tools.get_definitions(),
         )
-        if estimate <= trigger_threshold:
+        if estimate <= budget:
             return messages
 
         system_messages = [dict(msg) for msg in messages if msg.get("role") == "system"]
@@ -964,7 +1246,7 @@ class AgentRunner:
             return messages
 
         system_tokens = sum(estimate_message_tokens(msg) for msg in system_messages)
-        remaining_budget = max(128, drop_target - system_tokens)
+        remaining_budget = max(128, budget - system_tokens)
         kept: list[dict[str, Any]] = []
         kept_tokens = 0
         for message in reversed(non_system):
@@ -976,6 +1258,20 @@ class AgentRunner:
         kept.reverse()
 
         if kept:
+            for i, message in enumerate(kept):
+                if message.get("role") == "user":
+                    kept = kept[i:]
+                    break
+            else:
+                # Recover nearest user message from outside the kept window;
+                # GLM rejects system→assistant (error 1214).  Budget is
+                # intentionally exceeded — oversized beats invalid.
+                for idx in range(len(non_system) - 1, -1, -1):
+                    if non_system[idx].get("role") == "user":
+                        kept = non_system[idx:]
+                        break
+                # If no user exists at all, _enforce_role_alternation
+                # will insert a synthetic one as a safety net.
             start = find_legal_message_start(kept)
             if start:
                 kept = kept[start:]
@@ -984,35 +1280,6 @@ class AgentRunner:
             start = find_legal_message_start(kept)
             if start:
                 kept = kept[start:]
-
-        dropped_count = len(non_system) - len(kept)
-
-        # Inject a synthetic marker so the model knows a snip happened and
-        # where to find the full history (the session JSONL is the source of truth).
-        if dropped_count > 0:
-            session_key = spec.session_key or "default"
-            session_path = (
-                spec.workspace / "sessions" / f"{session_key}.jsonl"
-                if spec.workspace is not None else None
-            )
-            marker_text = (
-                f"[Context window snipped: {dropped_count} older messages dropped "
-                f"(tokens {estimate} > budget {budget})."
-            )
-            if session_path is not None:
-                marker_text += (
-                    f" Older turns are still on disk at {session_path} — "
-                    f"read that file if you need to recall prior tool calls or planning state.]"
-                )
-            else:
-                marker_text += "]"
-            kept = [{"role": "user", "content": marker_text}] + kept
-
-        logger.warning(
-            "snip_history: %d -> %d messages (tokens %d > budget %d) [session=%s]",
-            len(non_system), len(kept), estimate, budget,
-            spec.session_key or "default",
-        )
         return system_messages + kept
 
     def _partition_tool_batches(
@@ -1039,4 +1306,3 @@ class AgentRunner:
         if current:
             batches.append(current)
         return batches
-
