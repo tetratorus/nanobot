@@ -574,6 +574,24 @@ class AgentRunner:
             had_injections=had_injections,
         )
 
+    _MAX_MESSAGE_CHARS = 200_000
+
+    def _truncate_messages(
+        self,
+        messages: list[dict[str, Any]],
+        max_chars: int = _MAX_MESSAGE_CHARS,
+    ) -> list[dict[str, Any]]:
+        """Cap individual message sizes before sending to LLM."""
+        truncated = []
+        for msg in messages:
+            if isinstance(msg.get("content"), str) and len(msg["content"]) > max_chars:
+                msg = dict(msg)
+                msg["content"] = msg["content"][:max_chars] + (
+                    f"\n\n[Message truncated from {len(msg['content'])} chars to {max_chars}]"
+                )
+            truncated.append(msg)
+        return truncated
+
     def _build_request_kwargs(
         self,
         spec: AgentRunSpec,
@@ -581,6 +599,7 @@ class AgentRunner:
         *,
         tools: list[dict[str, Any]] | None,
     ) -> dict[str, Any]:
+        messages = self._truncate_messages(messages)
         kwargs: dict[str, Any] = {
             "messages": messages,
             "tools": tools,
