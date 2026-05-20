@@ -52,6 +52,7 @@ _DEFAULT_OPENROUTER_HEADERS = {
 }
 _KIMI_THINKING_MODELS: frozenset[str] = frozenset({
     "kimi-k2.5",
+    "kimi-k2.6",
     "k2.6-code-preview",
 })
 

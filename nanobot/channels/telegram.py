@@ -216,14 +216,57 @@ def _is_error_shaped(content: str) -> bool:
     return False
 
 
-def _route_error_to_hr_inbox(content: str) -> None:
-    """If outbound model content is error-shaped, drop a copy in HR's inbox.
+# --- Outbound hooks ----------------------------------------------------------
+# Registerable side-effects that fire for each final (non-progress) outbound
+# message. Use this to hook in logging, mail, audit trails, etc.
+#
+#   from nanobot.channels.telegram import register_outbound_hook
+#   register_outbound_hook(my_hook)
+#
+# Hooks receive an OutboundMessage and must never raise.
+_OUTBOUND_HOOKS: list[Callable[["OutboundMessage"], None]] = []
 
-    Best-effort. Never raises. Called from TelegramChannel.send for final
-    (non-progress) text replies. Self-suppresses when the sending agent is
+
+def register_outbound_hook(hook: Callable[["OutboundMessage"], None]) -> None:
+    """Register a hook called for each final outbound telegram message.
+
+    Hooks fire after the message is fully prepared but before it is sent to
+    Telegram. Use this for mail dispatch, audit logging, side-channel
+    notifications, etc. Hooks must never raise.
+    """
+    _OUTBOUND_HOOKS.append(hook)
+
+
+def _run_outbound_hooks(msg: "OutboundMessage") -> None:
+    """Fire all registered hooks. Never raises."""
+    for hook in _OUTBOUND_HOOKS:
+        try:
+            hook(msg)
+        except Exception as exc:
+            logger.debug("Outbound hook {} failed: {}", hook.__name__, exc)
+
+
+def _log_error_outbound(msg: "OutboundMessage") -> None:
+    """Default hook: log error-shaped outbound content for the AI to read."""
+    if not _is_error_shaped(msg.content):
+        return
+    try:
+        agent = getpass.getuser()
+    except Exception:
+        agent = "unknown-agent"
+    logger.warning(
+        "[outbound-error] agent={} chat={} content={}",
+        agent, msg.chat_id, msg.content[:500],
+    )
+
+
+def _route_error_to_hr_inbox(msg: "OutboundMessage") -> None:
+    """Hook: if outbound model content is error-shaped, drop a copy in HR's inbox.
+
+    Best-effort. Never raises. Self-suppresses when the sending agent is
     matron-hr to avoid a self-notification loop.
     """
-    if not _is_error_shaped(content):
+    if not _is_error_shaped(msg.content):
         return
     try:
         try:
@@ -246,13 +289,17 @@ def _route_error_to_hr_inbox(content: str) -> None:
             f"- channel: telegram\n"
             f"- timestamp: {ts_iso}\n\n"
             f"## Message content\n\n"
-            f"{content}\n"
+            f"{msg.content}\n"
         )
         path.write_text(body, encoding="utf-8")
     except Exception as e:
         # Routing must never break the send. Log at debug; HR can still see
         # the message in chat.
         logger.debug("error-routing to HR inbox failed: {}", e)
+
+
+register_outbound_hook(_log_error_outbound)
+register_outbound_hook(_route_error_to_hr_inbox)
 # -----------------------------------------------------------------------------
 
 
@@ -593,9 +640,9 @@ class TelegramChannel(BaseChannel):
 
         # Send text content
         if msg.content and msg.content != "[empty message]":
-            # Mirror error-shaped final replies to HR inbox (skip progress updates).
+            # Fire outbound hooks for final replies (skip progress updates).
             if not msg.metadata.get("_progress", False):
-                _route_error_to_hr_inbox(msg.content)
+                _run_outbound_hooks(msg)
             render_as_blockquote = bool(msg.metadata.get("_tool_hint"))
             for chunk in split_message(msg.content, TELEGRAM_MAX_MESSAGE_LEN):
                 await self._send_text(
