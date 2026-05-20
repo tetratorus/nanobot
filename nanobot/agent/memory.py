@@ -573,7 +573,7 @@ class Dream:
         store: MemoryStore,
         provider: LLMProvider,
         model: str,
-        max_batch_size: int = 20,
+        max_batch_size: int = 10,
         max_iterations: int = 10,
         max_tool_result_chars: int = 16_000,
     ):
@@ -658,7 +658,7 @@ class Dream:
         # Build history text for LLM — truncate individual entries and total
         # to prevent the model from burning all completion tokens on reasoning.
         _MAX_ENTRY_CHARS = 2_000
-        _MAX_HISTORY_CHARS = 15_000
+        _MAX_HISTORY_CHARS = 8_000
         entry_texts: list[str] = []
         total = 0
         for e in batch:
@@ -676,7 +676,7 @@ class Dream:
         history_text = "\n".join(entry_texts)
 
         # Current file contents — cap each to avoid bloating the prompt
-        _MAX_FILE_CHARS = 5_000
+        _MAX_FILE_CHARS = 3_000
         current_date = datetime.now().strftime("%Y-%m-%d")
         current_memory = self.store.read_memory() or "(empty)"
         if len(current_memory) > _MAX_FILE_CHARS:
@@ -700,25 +700,46 @@ class Dream:
             f"## Conversation History\n{history_text}\n\n{file_context}"
         )
 
-        try:
-            phase1_response = await self.provider.chat_with_retry(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": render_template("agent/dream_phase1.md", strip=True),
-                    },
-                    {"role": "user", "content": phase1_prompt},
-                ],
-                tools=None,
-                tool_choice=None,
-                max_tokens=2048,
+        async def _run_phase1(prompt: str) -> str:
+            try:
+                phase1_response = await self.provider.chat_with_retry(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": render_template("agent/dream_phase1.md", strip=True),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    tools=None,
+                    tool_choice=None,
+                    max_tokens=2048,
+                    reasoning_effort="low",
+                )
+                return phase1_response.content or ""
+            except Exception:
+                logger.exception("Dream Phase 1 failed")
+                return ""
+
+        analysis = await _run_phase1(phase1_prompt)
+        logger.debug("Dream Phase 1 analysis ({} chars): {}", len(analysis), analysis[:500])
+
+        # Retry with half batch if empty — the model may have been overwhelmed
+        if not analysis.strip() and len(batch) > 1:
+            logger.warning("Dream Phase 1 empty; retrying with half batch ({} entries)", len(batch) // 2)
+            half_batch = batch[: len(batch) // 2]
+            history_text_half = "\n".join(
+                f"[{e['timestamp']}] {e['content'][:_MAX_ENTRY_CHARS]}{' [truncated]' if len(e['content']) > _MAX_ENTRY_CHARS else ''}"
+                for e in half_batch
             )
-            analysis = phase1_response.content or ""
-            logger.debug("Dream Phase 1 analysis ({} chars): {}", len(analysis), analysis[:500])
-        except Exception:
-            logger.exception("Dream Phase 1 failed")
-            return False
+            phase1_prompt_half = (
+                f"## Conversation History\n{history_text_half}\n\n{file_context}"
+            )
+            analysis = await _run_phase1(phase1_prompt_half)
+            logger.debug("Dream Phase 1 retry analysis ({} chars): {}", len(analysis), analysis[:500])
+            if analysis.strip():
+                # Only advance cursor for the half batch that succeeded
+                batch = half_batch
 
         # Phase 2: Delegate to AgentRunner with read_file / edit_file
         existing_skills = self._list_existing_skills()

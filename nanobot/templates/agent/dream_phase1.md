@@ -1,30 +1,38 @@
-Compare conversation history against current memory files. Also scan memory files for stale content — even if not mentioned in history.
+# Dream memory consolidation for long-term memory.
 
-Output one line per finding:
-[FILE] atomic fact (not already in memory)
-[FILE-REMOVE] reason for removal
-[SKILL] kebab-case-name: one-line description of the reusable pattern
+## Your job
 
-Files: USER (identity, preferences), SOUL (bot behavior, tone), MEMORY (knowledge, project context)
+Read the conversation history and current memory files below. Identify the most important new facts to add and any stale facts to remove.
 
-Rules:
-- Atomic facts: "has a cat named Luna" not "discussed pet care"
-- Corrections: [USER] location is Tokyo, not Osaka
-- Capture confirmed approaches the user validated
+## Output format
 
-Staleness — flag for [FILE-REMOVE]:
-- Time-sensitive data older than 14 days: weather, daily status, one-time meetings, passed events
-- Completed one-time tasks: triage, one-time reviews, finished research, resolved incidents
-- Resolved tracking: merged/closed PRs, fixed issues, completed migrations
-- Detailed incident info after 14 days — reduce to one-line summary
-- Superseded: approaches replaced by newer solutions, deprecated dependencies
+Use these markers. Only include files that actually need changes.
 
-Skill discovery — flag [SKILL] when ALL of these are true:
-- A specific, repeatable workflow appeared 2+ times in the conversation history
-- It involves clear steps (not vague preferences like "likes concise answers")
-- It is substantial enough to warrant its own instruction set (not trivial like "read a file")
-- Do not worry about duplicates — the next phase will check against existing skills
+**Add content:**
+```
+[FILE] <filename>
+<concise bullet of the new fact to add>
+```
 
-Do not add: current weather, transient status, temporary errors, conversational filler.
+**Remove stale content:**
+```
+[FILE-REMOVE] <filename>
+<exact text of the stale fact to remove>
+```
 
-[SKIP] if nothing needs updating.
+**Create a new skill:**
+```
+[SKILL] <name>
+<brief description of what the skill does and when to use it>
+```
+
+If nothing needs updating, return exactly: `No changes needed.`
+
+## Rules
+
+1. **Top 3-5 facts only.** Don't list everything — focus on the highest-value new information.
+2. **Keep bullets concise.** 1-2 sentences max per fact.
+3. **Skip duplicates.** Don't add facts already present in memory files.
+4. **Prioritize:** user preferences (USER.md) > gotchas (MEMORY.md) > role changes (SOUL.md).
+5. **Flag contradictions.** If a memory fact is outdated, mark it [FILE-REMOVE] with the exact text.
+6. **No diff syntax.** Use plain [FILE] / [FILE-REMOVE] markers. Phase 2 will apply the edits.
