@@ -564,3 +564,50 @@ async def test_list_jobs_during_on_job_does_not_cause_stale_reload(tmp_path) -> 
         next_run = j["state"]["nextRunAtMs"]
         assert next_run is not None
         assert next_run > now_ms, f"Job '{j['name']}' next_run should be in the future"
+
+
+@pytest.mark.asyncio
+async def test_on_timer_does_not_overwrite_external_disk_modifications(tmp_path):
+    """Regression: if an on_job callback directly edits jobs.json (bypassing
+    the cron API), _on_timer's _save_store must not overwrite those edits —
+    otherwise zombie jobs re-appear on every timer tick and fire indefinitely."""
+    store_path = tmp_path / "cron" / "jobs.json"
+    execution_counts: dict[str, int] = {}
+
+    async def on_job_that_clears_disk(job):
+        execution_counts[job.id] = execution_counts.get(job.id, 0) + 1
+        # Simulate the agent directly emptying jobs.json on disk
+        store_path.write_text(json.dumps({"version": 1, "jobs": []}))
+        await asyncio.sleep(0)
+
+    service = CronService(store_path, on_job=on_job_that_clears_disk, max_sleep_ms=200)
+    await service.start()
+
+    # Add two due jobs
+    now_ms = int(time.time() * 1000)
+    for name in ("zombie-a", "zombie-b"):
+        service.add_job(
+            name=name,
+            schedule=CronSchedule(kind="every", every_ms=3_600_000),
+            message="zombie",
+        )
+    # Force next_run to the past so _on_timer picks them up
+    for job in service._store.jobs:
+        job.state.next_run_at_ms = now_ms - 1000
+    service._save_store()
+    service._arm_timer()
+
+    # Let the timer fire once
+    await asyncio.sleep(0.4)
+    service.stop()
+
+    # Each job should have fired exactly once (not looped forever)
+    assert len(execution_counts) == 2, \
+        f"Expected 2 jobs to fire, got {len(execution_counts)}: {execution_counts}"
+    assert all(count == 1 for count in execution_counts.values()), \
+        f"Expected each job to fire exactly once, got: {execution_counts}"
+
+    # Disk should NOT have the zombie jobs — the callback cleared them
+    raw = json.loads(store_path.read_text())
+    assert len(raw["jobs"]) == 0, \
+        f"Expected 0 jobs on disk after callback cleared them, got {len(raw['jobs'])}"

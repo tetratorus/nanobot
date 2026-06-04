@@ -369,6 +369,36 @@ class CronService:
             if job.enabled:
                 job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
 
+    def _sync_store_with_disk(self) -> None:
+        """Merge external disk modifications into the in-memory store.
+
+        Called before ``_save_store`` in ``_on_timer`` to avoid
+        overwriting changes made by callback code that edits
+        ``jobs.json`` directly (bypassing the cron API).
+
+        Disk is authoritative for job *existence* (adds/removals);
+        in-memory state is preserved for jobs still present on disk.
+        """
+        disk = self._load_jobs()
+        if disk is None or not self._store:
+            return
+        disk_jobs, _version = disk
+        # Fast path: no external modification (same number of jobs)
+        if len(disk_jobs) == len(self._store.jobs):
+            return
+        disk_ids = {j.id for j in disk_jobs}
+        mem_by_id = {j.id: j for j in self._store.jobs}
+        merged: list[CronJob] = []
+        # Preserve memory version for jobs still present on disk
+        for job in self._store.jobs:
+            if job.id in disk_ids:
+                merged.append(job)
+        # Adopt jobs added externally (present on disk, not in memory)
+        for disk_job in disk_jobs:
+            if disk_job.id not in mem_by_id:
+                merged.append(disk_job)
+        self._store.jobs = merged
+
     def _get_next_wake_ms(self) -> int | None:
         """Get the earliest next run time across all jobs."""
         if not self._store:
@@ -420,6 +450,12 @@ class CronService:
             for job in due_jobs:
                 await self._execute_job(job)
 
+            # Re-sync with disk before saving: callbacks may have modified
+            # jobs.json externally (e.g., agent decommission directly edits
+            # the store file instead of using the cron API).  Without this,
+            # _save_store blindly overwrites those edits and zombie jobs
+            # re-appear on every timer tick.
+            self._sync_store_with_disk()
             self._save_store()
         finally:
             self._timer_active = False

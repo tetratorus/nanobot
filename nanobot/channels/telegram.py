@@ -53,6 +53,17 @@ def _tool_hint_to_telegram_blockquote(text: str) -> str:
     return f"<blockquote expandable>{_escape_telegram_html(text)}</blockquote>" if text else ""
 
 
+def _parse_chat_id(chat_id: str | int) -> tuple[int, int | None]:
+    """Parse a chat ID, handling combined -100...:topic:... format."""
+    if isinstance(chat_id, int):
+        return chat_id, None
+    if isinstance(chat_id, str) and ":" in chat_id:
+        parts = chat_id.split(":")
+        if len(parts) >= 3 and parts[1] == "topic":
+            return int(parts[0]), int(parts[2])
+    return int(chat_id), None
+
+
 def _strip_md(s: str) -> str:
     """Strip markdown inline formatting from text."""
     s = re.sub(r'\*\*(.+?)\*\*', r'\1', s)
@@ -593,14 +604,17 @@ class TelegramChannel(BaseChannel):
                     await self._remove_reaction(msg.chat_id, int(reply_to_message_id))
 
         try:
-            chat_id = int(msg.chat_id)
+            chat_id, parsed_thread_id = _parse_chat_id(msg.chat_id)
         except ValueError:
             self.logger.exception("Invalid chat_id: {}", msg.chat_id)
             return
         reply_to_message_id = msg.metadata.get("message_id")
         message_thread_id = msg.metadata.get("message_thread_id")
+        if message_thread_id is None and parsed_thread_id is not None:
+            message_thread_id = parsed_thread_id
         if message_thread_id is None and reply_to_message_id is not None:
-            message_thread_id = self._message_threads.get((msg.chat_id, reply_to_message_id))
+            # Look up with the parsed integer chat_id for key matching
+            message_thread_id = self._message_threads.get((str(chat_id), reply_to_message_id))
         thread_kwargs = {}
         if message_thread_id is not None:
             thread_kwargs["message_thread_id"] = message_thread_id
@@ -759,7 +773,7 @@ class TelegramChannel(BaseChannel):
         if not self._app:
             return
         meta = metadata or {}
-        int_chat_id = int(chat_id)
+        int_chat_id, parsed_thread_id = _parse_chat_id(chat_id)
         stream_id = meta.get("_stream_id")
 
         if meta.get("_stream_end"):
